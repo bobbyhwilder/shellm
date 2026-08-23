@@ -61,7 +61,7 @@ Commands:
                             trajectory's first step, shows traj metadata.
                             Otherwise shows the step JSON.
 
-  tail [ID] [-n N] [-f] [--filter F] [-r] [--raw]
+  tail [ID] [-n N] [-f] [--filter F] [--types T] [-r] [--raw]
                             Show recent steps (formatted by default).
                             --filter field=val  Filter steps by field value.
                             Multiple --filter flags are AND'd, comma values OR'd.
@@ -1024,6 +1024,7 @@ _format_line() {
 
 cmd_tail() {
     local n=10 follow=0 raw=0 force_format=0 use_color=-1 traj_dir_opt="" traj_id_opt="" recursive=0 all_fields=0
+    local types="" match_bounded=0
     local -a filters=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1034,6 +1035,7 @@ cmd_tail() {
             --format)    force_format=1; shift ;;
             --no-color)  use_color=0; shift ;;
             --filter)    filters+=("${2:?--filter requires field=value}"); shift 2 ;;
+            --types)     types="${2:?--types requires type[,type...]}"; filters+=("type=$types"); match_bounded=1; shift 2 ;;
             -a|--all)    all_fields=1; shift ;;
             -r|--recursive) recursive=1; shift ;;
             -h|--help)
@@ -1042,7 +1044,8 @@ traj tail — Stream trajectory steps
 
 Usage:
   traj tail [ID] [-n N] [-f]        Show recent steps
-  traj tail [ID] --filter field=val  Filter steps
+  traj tail [ID] --filter field=val  Filter last N lines
+  traj tail [ID] --types T -n N     Last N steps of type T (scan backward)
   traj tail [ID] -r                  Include sub-trajectory steps
 
 Options:
@@ -1055,6 +1058,9 @@ Options:
   --filter field=val Filter steps (e.g. --filter type=thought,merge).
                      Multiple --filter flags are AND'd.
                      Comma-separated values within a filter are OR'd.
+  --types T          Last N matching types (thought,observation,...).
+                     Scans backward until N matches, unlike --filter
+                     which only inspects the last N lines.
   --raw              Raw JSONL (default when piped)
   --format           Force formatted output (even when piped)
   --no-color         Disable ANSI colors
@@ -1141,9 +1147,53 @@ TAILHELP
         done
     else
         [[ -f "$traj_file" ]] || die "tail: trajectory file not found: $traj_file"
-        tail -n "$n" "$traj_file" | while IFS= read -r line; do
-            _process_line "$line"
-        done
+        if [[ "$match_bounded" -eq 1 ]]; then
+            # A3: grow a backward window until we have N type-matches (or EOF).
+            # Plain `tail -n N | filter` under-reads when machinery dilutes the tail.
+            # Use jq -R + fromjson? so each JSONL line is parsed independently
+            # (same pattern as cmd_cat / recursive tail). Do not hide jq errors.
+            local window="$n" cap=200000 file_lines matched="" count
+            file_lines=$(wc -l < "$traj_file" | tr -d ' ')
+            [[ "$file_lines" =~ ^[0-9]+$ ]] || file_lines=0
+            while :; do
+                if [[ "$file_lines" -gt 0 && "$window" -gt "$file_lines" ]]; then
+                    window=$file_lines
+                fi
+                if [[ "$window" -gt "$cap" ]]; then
+                    window=$cap
+                fi
+                matched=$(tail -n "$window" "$traj_file" | jq -R -c --argjson filters "$_filter_json" '
+                    def matches_filters($fs):
+                        . as $step |
+                        ($fs | length == 0) or all($fs[];
+                            .key as $k | .vals as $vs |
+                            ($step[$k] // null) as $fv |
+                            ($vs | any(. as $v | $v == ($fv | tostring)))
+                        );
+                    fromjson? // empty | select(matches_filters($filters))
+                ' || true)
+                count=0
+                if [[ -n "$matched" ]]; then
+                    count=$(printf '%s\n' "$matched" | grep -c . || true)
+                fi
+                if [[ "$count" -ge "$n" || "$window" -ge "$file_lines" || "$window" -ge "$cap" || "$file_lines" -eq 0 ]]; then
+                    break
+                fi
+                window=$((window * 2))
+                if [[ "$window" -le 0 ]]; then
+                    window=$cap
+                fi
+            done
+            if [[ -n "$matched" ]]; then
+                printf '%s\n' "$matched" | tail -n "$n" | while IFS= read -r line; do
+                    _process_line "$line"
+                done
+            fi
+        else
+            tail -n "$n" "$traj_file" | while IFS= read -r line; do
+                _process_line "$line"
+            done
+        fi
     fi
 }
 
