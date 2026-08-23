@@ -6,9 +6,34 @@ import type { Mindlog, RunGroup } from "~/lib/types";
 
 /** First load ships only the newest steps — a grown mind log (20k+ steps,
  * full raw payloads) is hundreds of MB whole. Older history loads in
- * chunks on demand. */
-const INITIAL_TAIL = 1000;
-const OLDER_CHUNK = 2000;
+ * chunks on demand.
+ *
+ * iPhone Safari/Brave OOMs mounting ~1000 StepCards (no virtualizer;
+ * content-visibility is unreliable on iOS). Desktop keeps the large
+ * window; coarse+narrow or iOS gets a small first paint / older chunk. */
+const DESKTOP_INITIAL_TAIL = 1000;
+const MOBILE_INITIAL_TAIL = 80;
+const DESKTOP_OLDER_CHUNK = 2000;
+const MOBILE_OLDER_CHUNK = 200;
+
+function isCoarseMobile(): boolean {
+  if (typeof window === "undefined" || typeof navigator === "undefined") {
+    // SSR / unknown: prefer the small window so a phone never gets 1000 cards.
+    return true;
+  }
+  const coarse = window.matchMedia("(pointer: coarse)").matches;
+  const narrow = window.matchMedia("(max-width: 768px)").matches;
+  const ios = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  return ios || (coarse && narrow);
+}
+
+function initialTail(): number {
+  return isCoarseMobile() ? MOBILE_INITIAL_TAIL : DESKTOP_INITIAL_TAIL;
+}
+
+function olderChunk(): number {
+  return isCoarseMobile() ? MOBILE_OLDER_CHUNK : DESKTOP_OLDER_CHUNK;
+}
 
 /** Mindlog plus the absolute index of steps[0] in the full log. */
 export type MindlogData = Mindlog & { start: number };
@@ -30,10 +55,10 @@ function mergeRuns(prev: RunGroup[], delta: RunGroup[]): RunGroup[] {
 }
 
 /** Mind log with windowed loading: the first fetch asks for the newest
- * INITIAL_TAIL steps only; each poll asks for steps beyond what we hold
+ * initialTail() steps only; each poll asks for steps beyond what we hold
  * (?since=N, absolute index) and appends them; runs arrive as deltas
  * (only the ones new steps touched) and are merged by id. loadOlder()
- * prepends the next OLDER_CHUNK of history. Old step objects keep their
+ * prepends the next olderChunk() of history. Old step objects keep their
  * identity, so memoized step components skip re-rendering. A shrunken
  * step_count (log reset/rewritten) falls back to a fresh tail fetch. */
 export function useMindlog(identityId: string, live: boolean) {
@@ -48,13 +73,13 @@ export function useMindlog(identityId: string, live: boolean) {
         identityId,
       ]);
       if (!prev || !prev.steps.length) {
-        const first = await fetchMindlog(identityId, { tail: INITIAL_TAIL });
+        const first = await fetchMindlog(identityId, { tail: initialTail() });
         return { ...first, start: first.since ?? 0 };
       }
       const held = prev.start + prev.steps.length;
       const delta = await fetchMindlog(identityId, { since: held });
       if (delta.step_count < held) {
-        const fresh = await fetchMindlog(identityId, { tail: INITIAL_TAIL });
+        const fresh = await fetchMindlog(identityId, { tail: initialTail() });
         return { ...fresh, start: fresh.since ?? 0 };
       }
       if (!delta.steps.length && !delta.runs.length) {
@@ -75,7 +100,7 @@ export function useMindlog(identityId: string, live: boolean) {
     if (!prev || prev.start <= 0) return;
     setLoadingOlder(true);
     try {
-      const from = Math.max(0, prev.start - OLDER_CHUNK);
+      const from = Math.max(0, prev.start - olderChunk());
       const older = await fetchMindlog(identityId, {
         since: from,
         until: prev.start,
