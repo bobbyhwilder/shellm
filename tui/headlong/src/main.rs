@@ -492,7 +492,8 @@ async fn run(
         });
     };
 
-    // Phase 1: load recent history via `traj cat --filter | tail -n 20`
+    // Phase 1: load recent history via `traj tail --types … -n 20`
+    // Backward scan (A3): last 20 matching steps, not last 20 raw lines.
     // Use ROOT_TRAJ_ID so we always read from the root trajectory
     let id_hist = id_name.clone();
     let tx_hist = tx.clone();
@@ -501,7 +502,7 @@ async fn run(
             .or_else(|_| env::var("TRAJ_ID"))
             .unwrap_or_default();
         let cmd = format!(
-            "traj cat {} --filter type=message,human-msg,agent-msg --raw 2>/dev/null | tail -n 20",
+            "traj tail {} --types message,human-msg,agent-msg -n 20 --raw --no-color 2>/dev/null",
             shell_escape(&traj_id)
         );
         let Ok(output) = tokio::process::Command::new("bash")

@@ -118,7 +118,7 @@ three concrete steps:
    `_recent_stream` over-reads a fixed 5000 lines (and silently under-reads if
    machinery ever exceeds that window). Add `traj tail --types … -n N` that reads
    **backward until it has N matches** (bounded, exact), and route
-   `_recent_stream` and the TUI's phase-1 load (`traj cat --filter | tail -20`,
+   `_recent_stream` and the TUI's phase-1 load (`traj tail --types … -n 20`,
    currently O(file)) through it.
 3. **Unify on a *contract*, not a single binary.** You cannot literally share
    one reader across bash (`traj`), Python (web), and Rust (TUI). What must be
