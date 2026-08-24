@@ -146,10 +146,68 @@ next_blob_id() {
     local blob_dir="$1" step_id="$2"
     local count=0
     if [[ -d "$blob_dir" ]]; then
-        count=$(find "$blob_dir" -maxdepth 1 -name "${step_id}-*" \( -name '*.stdout' -o -name '*.stderr' \) 2>/dev/null | wc -l | tr -d ' ')
+        count=$(find "$blob_dir" -maxdepth 1 -name "${step_id}-*" ! -name '.tmp.*' 2>/dev/null | wc -l | tr -d ' ')
     fi
     printf '%06x' "$count"
 }
+
+
+# Spill every oversized *string* field on $record into blobs/.
+# Sets: $record. Uses: $blob_dir $step_id $STDOUT_INLINE_LIMIT.
+# Structured values (objects/arrays/numbers) stay inline. Tiny keys
+# (type, step_id, *_ref, …) stay inline because they are under the limit.
+_spill_oversized_fields() {
+    local field field_type field_val field_bytes blob_id blob_file blob_ref tmp_blob inline_val
+    local pairs
+    pairs=$(printf '%s' "$record" | jq -r 'to_entries[] | "\(.key)\t\(.value|type)"') || return 0
+    [[ -n "$pairs" ]] || return 0
+    while IFS=$'\t' read -r field field_type; do
+        [[ -n "$field" ]] || continue
+        [[ "$field_type" == "string" ]] || continue
+        [[ "$field" == *_ref ]] && continue
+        field_val=$(printf '%s' "$record" | jq -r --arg k "$field" '.[$k] // empty')
+        field_bytes=$(byte_len "$field_val")
+        if [[ "$field_bytes" -gt "$STDOUT_INLINE_LIMIT" && -n "$field_val" ]]; then
+            mkdir -p "$blob_dir"
+            blob_id=$(next_blob_id "$blob_dir" "$step_id")
+            blob_file="$blob_dir/${step_id}-${blob_id}.${field}"
+            blob_ref="blobs/${step_id}-${blob_id}.${field}"
+            tmp_blob=$(mktemp "$blob_dir/.tmp.XXXXXX")
+            printf '%s' "$field_val" > "$tmp_blob"
+            sync "$tmp_blob" 2>/dev/null || true
+            mv "$tmp_blob" "$blob_file"
+            inline_val=${field_val:0:$STDOUT_INLINE_LIMIT}
+            record=$(printf '%s' "$record" | jq \
+                --arg k "$field" \
+                --arg v "$inline_val" \
+                --arg ref "$blob_ref" \
+                --argjson bytes "$field_bytes" \
+                '.[$k] = $v
+                 | .[$k + "_ref"] = $ref
+                 | .[$k + "_bytes"] = $bytes
+                 | .[$k + "_truncated"] = true')
+        fi
+    done <<< "$pairs"
+}
+
+# Expand every *_ref on $row from sibling blobs/. Used by cmd_show --full.
+_expand_blob_refs() {
+    local traj_file="$1"
+    local refs ref_key ref_val field blob_path full_val
+    refs=$(printf '%s' "$row" | jq -r 'to_entries[] | select((.key|endswith("_ref")) and ((.value|type)=="string") and .value != "") | "\(.key)\t\(.value)"') || return 0
+    [[ -n "$refs" ]] || return 0
+    while IFS=$'\t' read -r ref_key ref_val; do
+        [[ -n "$ref_key" ]] || continue
+        field="${ref_key%_ref}"
+        blob_path="$(dirname "$traj_file")/$ref_val"
+        if [[ -f "$blob_path" ]]; then
+            full_val=$(cat "$blob_path")
+            row=$(printf '%s' "$row" | jq --arg k "$field" --arg v "$full_val" \
+                '.[$k] = $v | del(.[$k + "_truncated"])')
+        fi
+    done <<< "$refs"
+}
+
 
 # Byte length of a string (LC_ALL=C to count bytes, not chars).
 byte_len() {
@@ -471,67 +529,8 @@ cmd_append() {
     iso_ts=$(_iso_ts)
     record=$(printf '%s' "$record" | jq --arg id "$step_id" --arg ts "$iso_ts" '. + {step_id: $id, ts: $ts}')
 
-    # Process stdout: spill if over limit.
-    local stdout_val
-    stdout_val=$(printf '%s' "$record" | jq -r '.stdout // empty')
-    local stdout_bytes
-    stdout_bytes=$(byte_len "$stdout_val")
-
-    if [[ "$stdout_bytes" -gt "$STDOUT_INLINE_LIMIT" ]] && [[ -n "$stdout_val" ]]; then
-        mkdir -p "$blob_dir"
-        local blob_id
-        blob_id=$(next_blob_id "$blob_dir" "$step_id")
-        local blob_file="$blob_dir/${step_id}-${blob_id}.stdout"
-        local blob_ref="blobs/${step_id}-${blob_id}.stdout"
-
-        local tmp_blob
-        tmp_blob=$(mktemp "$blob_dir/.tmp.XXXXXX")
-        printf '%s' "$stdout_val" > "$tmp_blob"
-        sync "$tmp_blob" 2>/dev/null || true
-        mv "$tmp_blob" "$blob_file"
-
-        local inline_val
-        # param-expansion, not printf|head -c: the latter SIGPIPEs under pipefail
-        # when the value exceeds the pipe buffer (~64KB), which made traj append
-        # exit 141 and take the shellm run down with it. See
-        # design/monolith_run_health.md B1.
-        inline_val=${stdout_val:0:$STDOUT_INLINE_LIMIT}
-
-        record=$(printf '%s' "$record" | jq \
-            --arg stdout "$inline_val" \
-            --arg ref "$blob_ref" \
-            --argjson bytes "$stdout_bytes" \
-            '. + {stdout: $stdout, stdout_ref: $ref, stdout_bytes: $bytes, stdout_truncated: true}')
-    fi
-
-    # Process stderr: spill if over limit.
-    local stderr_val
-    stderr_val=$(printf '%s' "$record" | jq -r '.stderr // empty')
-    local stderr_bytes
-    stderr_bytes=$(byte_len "$stderr_val")
-
-    if [[ "$stderr_bytes" -gt "$STDOUT_INLINE_LIMIT" ]] && [[ -n "$stderr_val" ]]; then
-        mkdir -p "$blob_dir"
-        local blob_id
-        blob_id=$(next_blob_id "$blob_dir" "$step_id")
-        local blob_file="$blob_dir/${step_id}-${blob_id}.stderr"
-        local blob_ref="blobs/${step_id}-${blob_id}.stderr"
-
-        local tmp_blob
-        tmp_blob=$(mktemp "$blob_dir/.tmp.XXXXXX")
-        printf '%s' "$stderr_val" > "$tmp_blob"
-        sync "$tmp_blob" 2>/dev/null || true
-        mv "$tmp_blob" "$blob_file"
-
-        local inline_val
-        inline_val=${stderr_val:0:$STDOUT_INLINE_LIMIT}
-
-        record=$(printf '%s' "$record" | jq \
-            --arg stderr "$inline_val" \
-            --arg ref "$blob_ref" \
-            --argjson bytes "$stderr_bytes" \
-            '. + {stderr: $stderr, stderr_ref: $ref, stderr_bytes: $bytes, stderr_truncated: true}')
-    fi
+    # Spill any oversized string field (stdout, stderr, content, command, …).
+    _spill_oversized_fields
 
     # Append row to file (compact, one line).
     mkdir -p "$(dirname "$traj_file")"
@@ -677,30 +676,9 @@ cmd_show() {
     local blob_dir
     blob_dir="$(dirname "$traj_file")/blobs"
 
-    # If --full, replace truncated stdout/stderr with blob contents.
+    # If --full, replace every truncated field with its blob contents.
     if [[ "$full" -eq 1 ]]; then
-        local stdout_ref
-        stdout_ref=$(printf '%s' "$row" | jq -r '.stdout_ref // empty')
-        if [[ -n "$stdout_ref" ]]; then
-            local blob_path
-            blob_path="$(dirname "$traj_file")/$stdout_ref"
-            if [[ -f "$blob_path" ]]; then
-                local full_stdout
-                full_stdout=$(cat "$blob_path")
-                row=$(printf '%s' "$row" | jq --arg v "$full_stdout" '.stdout = $v | del(.stdout_truncated)')
-            fi
-        fi
-        local stderr_ref
-        stderr_ref=$(printf '%s' "$row" | jq -r '.stderr_ref // empty')
-        if [[ -n "$stderr_ref" ]]; then
-            local blob_path
-            blob_path="$(dirname "$traj_file")/$stderr_ref"
-            if [[ -f "$blob_path" ]]; then
-                local full_stderr
-                full_stderr=$(cat "$blob_path")
-                row=$(printf '%s' "$row" | jq --arg v "$full_stderr" '.stderr = $v | del(.stderr_truncated)')
-            fi
-        fi
+        _expand_blob_refs "$traj_file"
     fi
 
     # If --field, emit just that field's raw bytes.
@@ -1233,7 +1211,7 @@ cmd_search() {
     # Search all non-metadata fields by default, or specific field.
     local fields_to_search
     case "$field" in
-        all) fields_to_search="content thought cmd stdout stderr" ;;
+        all) fields_to_search="content thought cmd command stdout stderr" ;;
         *)   fields_to_search="$field" ;;
     esac
 
@@ -1268,21 +1246,23 @@ cmd_search() {
 
             for f in $fields_to_search; do
                 local content=""
-
-                # For stdout/stderr, check if there's a blob and use that for full search.
-                local ref_key="${f}_ref"
-                local ref_val
-                ref_val=$(printf '%s' "$row" | jq -r ".${ref_key} // empty" 2>/dev/null)
-
-                if [[ -n "$ref_val" ]] && [[ -f "$blob_base/$ref_val" ]]; then
-                    content=$(cat "$blob_base/$ref_val")
-                else
-                    content=$(printf '%s' "$row" | jq -r ".${f} // empty")
+                # Follow any field's *_ref blob (content/command/stdout/stderr).
+                local blob_file="" ref=""
+                ref=$(printf '%s' "$row" | jq -r --arg f "$f" '.[$f + "_ref"] // empty')
+                if [[ -n "$ref" ]]; then
+                    blob_file="$ref"
+                    if [[ "$blob_file" != /* ]]; then
+                        blob_file="$blob_base/$blob_file"
+                    fi
+                    if [[ -f "$blob_file" ]]; then
+                        content=$(cat "$blob_file")
+                    fi
                 fi
-
+                if [[ -z "$content" ]]; then
+                    content=$(printf '%s' "$row" | jq -r --arg f "$f" '.[$f] // empty | if type == "string" then . else empty end')
+                fi
                 [[ -n "$content" ]] || continue
 
-                # Search the content.
                 local matches
                 matches=$(printf '%s\n' "$content" | grep "${grep_args[@]}" -- "$pattern" 2>/dev/null || true)
                 [[ -n "$matches" ]] || continue
