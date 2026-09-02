@@ -38,6 +38,28 @@ _chat_append() {
     traj append "${ROOT_TRAJ_ID:-$TRAJ_ID}" >/dev/null
 }
 
+# Strip leaked internal command dumps before a message hits the chat log.
+# A model sometimes echoes its own command trace after its reply: SO/SI
+# getcmd wrappers (\x0e/\x0f), or the same markers re-encoded as literal
+# "0egetcmd0e"/"1egetcmd0e" text, followed by tool_call/mindlog markup.
+# Everything from the first such marker onward is internal — cut there,
+# then drop ANSI CSI sequences and C0 control bytes (keeping tab and
+# newline; high bytes untouched so UTF-8 survives), and rstrip.
+# tests/test_chat_sanitize.sh extracts this function by name — keep the
+# opening line and closing brace at column 0.
+_sanitize_message() {
+    local msg="${1-}"
+    msg="${msg%%$'\x0e'getcmd*}"
+    msg="${msg%%$'\x0f'getcmd*}"
+    msg="${msg%%0egetcmd0e*}"
+    msg="${msg%%1egetcmd0e*}"
+    msg="$(printf '%s' "$msg" \
+        | LC_ALL=C sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' \
+        | LC_ALL=C tr -d '\000-\010\013-\037')"
+    msg="${msg%"${msg##*[![:space:]]}"}"
+    printf '%s' "$msg"
+}
+
 # Handle --help before env var check
 case "${1:-}" in -h|--help|help) ;; *)
     [[ -n "${TRAJ_DIR:-}" ]] || die "TRAJ_DIR not set. Run: identity shell <name>"
@@ -80,6 +102,9 @@ cmd_send() {
         message=$(cat)
     fi
     [[ -z "$message" ]] && die "No message provided. Usage: chat send [--from <name>] [--to <name>] <message>"
+
+    message="$(_sanitize_message "$message")"
+    [[ -z "$message" ]] && die "message contained only an internal command dump — nothing to send"
 
     _resolve_from_to
 
@@ -131,6 +156,9 @@ cmd_reply() {
         message=$(cat)
     fi
     [[ -z "$message" ]] && die "No message provided. Usage: chat reply <to_name> <message>"
+
+    message="$(_sanitize_message "$message")"
+    [[ -z "$message" ]] && die "message contained only an internal command dump — nothing to send"
 
     local from="${IDENTITY_NAME:-}"
     [[ -z "$from" ]] && die "IDENTITY_NAME not set. Run: identity shell <name>"
