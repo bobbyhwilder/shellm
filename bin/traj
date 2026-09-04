@@ -68,9 +68,10 @@ Commands:
                             -r/--recursive includes sub-trajectory steps.
                             --raw for JSONL output.
 
-  search <pattern> [ID] [--field F] [-i] [-C N] [-E] [-r]
+  search <pattern> [ID] [--field F] [-i] [-C N] [-E] [-r] [-n N] [--limit N]
                             Search step fields. Default field: all.
                             -r, --recursive  Search sub-trajectories too.
+                            -n, --limit N    Limit number of matches returned.
 
   count [ID]                Print step count.
 
@@ -1180,7 +1181,7 @@ TAILHELP
 # ---------------------------------------------------------------------------
 
 cmd_search() {
-    local pattern="" field="all" case_flag="" context_lines=0 use_regex=0 traj_dir_opt="" traj_id_opt="" recursive=0
+    local pattern="" field="all" case_flag="" context_lines=0 use_regex=0 traj_dir_opt="" traj_id_opt="" recursive=0 limit=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --field)     field="${2:?--field requires a value}"; shift 2 ;;
@@ -1189,6 +1190,7 @@ cmd_search() {
             -C)          context_lines="${2:?-C requires a number}"; shift 2 ;;
             -E)          use_regex=1; shift ;;
             -r|--recursive) recursive=1; shift ;;
+            -n|--limit)  limit="${2:?-n/--limit requires a number}"; shift 2 ;;
             -*)          die "search: unknown option: $1" ;;
             *)
                 if [[ -z "$pattern" ]]; then
@@ -1231,26 +1233,27 @@ cmd_search() {
         _search_files="$traj_file"
     fi
 
+    local match_count=0
     while IFS= read -r _sf; do
-        [[ -f "$_sf" ]] || continue
+        [[ -n "$_sf" ]] || continue
         local _traj_hex
-        _traj_hex=$(_parse_hex_id "$_sf")
-        local blob_base
-        blob_base="$(dirname "$_sf")"
+        _traj_hex=$(basename "$_sf" .jsonl | sed 's/^traj_//')
 
-        # Iterate over each row in the trajectory.
         while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
             local step_id
             step_id=$(printf '%s' "$row" | jq -r '.step_id // empty')
             [[ -n "$step_id" ]] || continue
 
             for f in $fields_to_search; do
                 local content=""
-                # Follow any field's *_ref blob (content/command/stdout/stderr).
-                local blob_file="" ref=""
+                # Check for blob reference first
+                local ref
                 ref=$(printf '%s' "$row" | jq -r --arg f "$f" '.[$f + "_ref"] // empty')
                 if [[ -n "$ref" ]]; then
-                    blob_file="$ref"
+                    local blob_base
+                    blob_base=$(dirname "$_sf")/.blobs
+                    local blob_file="$ref"
                     if [[ "$blob_file" != /* ]]; then
                         blob_file="$blob_base/$blob_file"
                     fi
@@ -1274,12 +1277,15 @@ cmd_search() {
                     else
                         printf '%s:%s:%s\n' "$step_id" "$f" "$match_line"
                     fi
+                    match_count=$((match_count + 1))
+                    if [[ "$limit" -gt 0 && "$match_count" -ge "$limit" ]]; then
+                        return 0
+                    fi
                 done <<< "$matches"
             done
         done < "$_sf"
     done <<< "$_search_files"
 }
-
 # ---------------------------------------------------------------------------
 # fork
 # ---------------------------------------------------------------------------

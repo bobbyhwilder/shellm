@@ -68,6 +68,8 @@ state_dir="$IDENTITY_DIR/run"
 mkdir -p "$state_dir"
 state_file="$state_dir/monolith_backoff_state.json"
 wake_at_file="$state_dir/$THINKER_NAME.wake_at"
+gap_file="$state_dir/gap.json"
+root_traj="${ROOT_TRAJ_ID:-$TRAJ_ID}"
 
 # delay in seconds for a backoff level.
 _delay_for_level() {
@@ -120,14 +122,251 @@ _save_state() {
 # fires us when it comes due. This replaces the old `setsid` background timer,
 # which never ran on macOS (no setsid → the spawn failed, recorded a dead pid,
 # and posted no wake, so spontaneity silently died). No process to detach, no
-# PID reuse, no group-kill, no reap race. Only arm while a dispatcher owns the
-# runtime, so a wake_at can't linger past shutdown.
+# PID reuse, no group-kill, no reap race. Always write wake_at — even if
+# run/dispatcher.token is momentarily missing (e.g. mid-restart) — because a
+# skipped write kills spontaneity permanently, while a lingering wake_at is
+# harmless: the dispatcher's own token check gates whether the wake ever fires.
 arm_wake() {
     local delay="$1"
-    [[ -f "$state_dir/dispatcher.token" ]] || return 0
     local now
     now=$(date +%s)
     printf '%s' "$(( now + delay ))" > "$wake_at_file"
+}
+
+# Redacted last-N-lines of a run's stderr for the durable error step.
+# Strips ANSI, then masks sk-* keys, Bearer tokens, api_key= and token:
+# values so provider context is diagnosable without leaking secrets into
+# the trajectory. Fail-soft: missing file → empty stdout, exit 0.
+_stderr_tail_redacted() {
+    local file="${1:-}" n="${2:-15}"
+    [[ -n "$file" && -f "$file" ]] || return 0
+    python3 - "$file" "$n" <<'PY'
+import re, sys
+path, n_s = sys.argv[1], sys.argv[2]
+try:
+    n = int(n_s)
+except ValueError:
+    n = 15
+try:
+    raw = open(path, "r", errors="replace").read()
+except OSError:
+    sys.exit(0)
+raw = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw)
+lines = raw.splitlines()
+n = max(0, n)
+tail = lines[-n:] if n else lines
+text = "\n".join(tail)
+text = re.sub(r"sk-[A-Za-z0-9_-]+", "[redacted]", text)
+text = re.sub(r"(?i)(api[_-]?key\s*[=:]\s*)\S+", r"\1[redacted]", text)
+text = re.sub(r"(?i)(token:\s*)\S+", r"\1[redacted]", text)
+text = re.sub(r"(?i)(Bearer\s+)\S+", r"\1[redacted]", text)
+sys.stdout.write(text)
+PY
+}
+
+
+# ---------------------------------------------------------------------------
+# Gap sense — interoception of the between-wakes (design/gap_sense.md).
+# Sidecar is written here; the model only sees a one-line routing stanza.
+# Fail-soft: a broken sense is silence (`gap: unknown`), never a fake clock.
+# ---------------------------------------------------------------------------
+_gap_fmt() {
+    local s="${1:-0}"
+    [[ "$s" =~ ^[0-9]+$ ]] || s=0
+    if (( s < 60 )); then printf '%ss' "$s"
+    elif (( s < 3600 )); then printf '%sm' "$(( s / 60 ))"
+    elif (( s < 86400 )); then printf '%sh' "$(( s / 3600 ))"
+    else printf '%sd' "$(( s / 86400 ))"
+    fi
+}
+
+_gap_mtime() {
+    local path="$1"
+    [[ -e "$path" ]] || return 1
+    stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null
+}
+
+_gap_same_key() {
+    # Coarse key: short type + crushed content stem. Not a semantic judge.
+    local typ="$1" content="$2" short stem
+    case "$typ" in
+        observation) short=obs ;;
+        action)      short=act ;;
+        thought)     short=th ;;
+        idle)        short=idle ;;
+        merge)       short=merge ;;
+        message)     short=msg ;;
+        *)           short=$(printf '%s' "$typ" | cut -c1-8) ;;
+    esac
+    [[ -n "$short" ]] || short="unk"
+    stem=$(printf '%s' "$content" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' | cut -c1-40)
+    [[ -n "$stem" ]] || stem="empty"
+    printf '%s+%s' "$short" "$stem"
+}
+
+_gap_world_moved() {
+    # Cheap OR: this wake is reactive, or a file under mem/chat/inbox is newer
+    # than the previous monolith end. Directory mtime alone is not a knock —
+    # mkdir of an empty folder (identity setup) is not the room speaking.
+    local prev_end="$1" mt path f
+    if [[ "${wake_mode:-}" == "reactive" ]]; then
+        return 0
+    fi
+    [[ "$prev_end" =~ ^[0-9]+$ ]] || return 1
+    for path in \
+        "${MEM_DIR:-}" \
+        "${IDENTITY_DIR:-}/chat" \
+        "${IDENTITY_DIR:-}/inbox" \
+        "${IDENTITY_DIR:-}/run/hermes-inbox"
+    do
+        [[ -n "$path" && -e "$path" ]] || continue
+        if [[ -f "$path" ]]; then
+            mt=$(_gap_mtime "$path") || continue
+            if (( mt > prev_end )); then
+                return 0
+            fi
+            continue
+        fi
+        [[ -d "$path" ]] || continue
+        while IFS= read -r -d '' f; do
+            mt=$(_gap_mtime "$f") || continue
+            if (( mt > prev_end )); then
+                return 0
+            fi
+        done < <(find "$path" -type f -print0 2>/dev/null)
+    done
+    return 1
+}
+
+_stamp_gap_end() {
+    # EXIT: record when this process actually ended. Keep other sidecar fields.
+    local now tmp
+    [[ -n "${gap_file:-}" ]] || return 0
+    now=$(date +%s) || return 0
+    mkdir -p "$(dirname "$gap_file")" 2>/dev/null || return 0
+    if [[ -f "$gap_file" ]]; then
+        tmp=$(mktemp "${gap_file}.XXXXXX") || return 0
+        if jq --argjson t "$now" '.t_prev_end=$t' "$gap_file" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$gap_file"
+        else
+            rm -f "$tmp"
+            printf '{"schema":"gap/v0","t_prev_end":%s}\n' "$now" > "$gap_file" 2>/dev/null || true
+        fi
+    else
+        printf '{"schema":"gap/v0","t_prev_end":%s}\n' "$now" > "$gap_file" 2>/dev/null || true
+    fi
+}
+
+_gap_refresh() {
+    # Read previous sidecar, compute this wakeup's sense, inject stanza, write.
+    # Sets: gap_stanza (always), and rewrites $gap_file.
+    local now prev_end gap_s since_non last_type last_content same_key
+    local consecutive world body prev_same prev_consec prev_since
+    local last_json stanza room
+    gap_stanza="gap: unknown"
+    now=$(date +%s) || now=0
+
+    last_type=""
+    last_content=""
+    last_json=""
+    if traj exists 2>/dev/null; then
+        last_json=$(traj tail -n 1 --raw --filter source=monolith --match-bounded 2>/dev/null) || last_json=""
+    fi
+    if [[ -n "$last_json" ]]; then
+        last_type=$(printf '%s' "$last_json" | jq -r '.type // empty' 2>/dev/null) || last_type=""
+        last_content=$(printf '%s' "$last_json" | jq -r '.content // empty' 2>/dev/null) || last_content=""
+    fi
+    same_key=$(_gap_same_key "${last_type:-unk}" "$last_content")
+
+    prev_end=""
+    prev_same=""
+    prev_consec=0
+    prev_since=""
+    if [[ -f "$gap_file" ]]; then
+        prev_end=$(jq -r '.t_prev_end // empty' "$gap_file" 2>/dev/null) || prev_end=""
+        prev_same=$(jq -r '.same_key // empty' "$gap_file" 2>/dev/null) || prev_same=""
+        prev_consec=$(jq -r '.consecutive_same // 0' "$gap_file" 2>/dev/null) || prev_consec=0
+        prev_since=$(jq -r '.since_non_idle_s // empty' "$gap_file" 2>/dev/null) || prev_since=""
+    fi
+    [[ "$prev_consec" =~ ^[0-9]+$ ]] || prev_consec=0
+
+    if [[ -z "$prev_end" || ! "$prev_end" =~ ^[0-9]+$ ]]; then
+        body="first-light"
+        gap_s=0
+        since_non=0
+        consecutive=0
+        world=false
+        stanza="gap: unknown"
+    else
+        gap_s=$(( now - prev_end ))
+        (( gap_s < 0 )) && gap_s=0
+        if _gap_world_moved "$prev_end"; then
+            world=true
+        else
+            world=false
+        fi
+        if [[ "$world" == "true" || -z "$prev_same" || "$same_key" != "$prev_same" ]]; then
+            consecutive=1
+        else
+            consecutive=$(( prev_consec + 1 ))
+        fi
+        if [[ "$last_type" == "idle" ]]; then
+            if [[ "$prev_since" =~ ^[0-9]+$ ]]; then
+                since_non=$(( prev_since + gap_s ))
+            else
+                since_non=$gap_s
+            fi
+        else
+            since_non=$gap_s
+        fi
+        if (( gap_s >= 1800 )); then
+            body="returning"
+        elif [[ "$last_type" == "idle" && "$world" == "false" ]]; then
+            body="resting"
+        elif (( consecutive >= 3 && gap_s < 600 )); then
+            body="spinning"
+        else
+            body="in-stride"
+        fi
+        if [[ "$world" == "true" ]]; then room="room knocked"; else room="room quiet"; fi
+        stanza=$(printf 'gap: %s since last end · %s since a non-idle · %s ×%s (%s) · %s' \
+            "$(_gap_fmt "$gap_s")" \
+            "$(_gap_fmt "$since_non")" \
+            "$body" \
+            "$consecutive" \
+            "$same_key" \
+            "$room")
+    fi
+    gap_stanza="$stanza"
+
+    mkdir -p "$(dirname "$gap_file")" 2>/dev/null || true
+    local tmp
+    tmp=$(mktemp "${gap_file}.XXXXXX") || return 0
+    if jq -n \
+        --arg schema "gap/v0" \
+        --argjson t_prev_end "${prev_end:-0}" \
+        --argjson t_now "$now" \
+        --argjson gap_s "${gap_s:-0}" \
+        --argjson since_non_idle_s "${since_non:-0}" \
+        --argjson consecutive_same "${consecutive:-0}" \
+        --arg same_key "$same_key" \
+        --argjson world_moved "$world" \
+        --arg body "$body" \
+        '{
+          schema:$schema,
+          t_prev_end:$t_prev_end,
+          t_now:$t_now,
+          gap_s:$gap_s,
+          since_non_idle_s:$since_non_idle_s,
+          consecutive_same:$consecutive_same,
+          same_key:$same_key,
+          world_moved:$world_moved,
+          body:$body
+        }' > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$gap_file"
+    else
+        rm -f "$tmp"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -138,28 +377,31 @@ step_json=$(cat)
 trigger_type=$(printf '%s' "$step_json" | jq -r '.type // empty' 2>/dev/null) || true
 trigger_source=$(printf '%s' "$step_json" | jq -r '.source // empty' 2>/dev/null) || true
 trigger_step_id=$(printf '%s' "$step_json" | jq -r '.step_id // empty' 2>/dev/null) || true
+trigger_content=$(printf '%s' "$step_json" | jq -r '.content // empty' 2>/dev/null) || true
 
 # ---------------------------------------------------------------------------
-# EXIT-trap liveness: arm the next timer on the way out. next_delay stays ""
-# for no-op wakes (leave the running timer untouched); it is set to 0 (arm an
-# immediate wake — keep thinking) or delay(level) (rest) by the handlers below.
-# The trap fires on EVERY exit, including crash/refusal paths, so the loop
-# cannot die by "appending nothing" the way trigger_self used to guard against.
+# EXIT-trap liveness: arm the next timer on the way out, on EVERY exit — crash,
+# refusal, and no-op paths included — so run/<name>.wake_at is ALWAYS re-armed
+# and the loop cannot die by "appending nothing" the way trigger_self used to
+# guard against. next_delay is set to 0 (arm an immediate wake — keep thinking)
+# or delay(level) (rest) by the handlers below; if a path exits with it still
+# empty (early no-op wakes, deaths before classification), default to the
+# current backoff delay rather than skipping the re-arm.
 # ---------------------------------------------------------------------------
 next_delay=""
-trap '[[ -n "$next_delay" ]] && arm_wake "$next_delay"' EXIT
+trap 'arm_wake "${next_delay:-$(_delay_for_level "$level")}"; _stamp_gap_end' EXIT
 
 # Classify the wake. With trigger_self:false the dispatcher already filters our
 # own steps, so these are all external — but stay defensive.
 case "$trigger_type" in
     message)
         # We do not subscribe to message (responder owns chat). Defensive no-op;
-        # leave the running timer alone.
+        # the EXIT trap still re-arms spontaneity.
         exit 0
         ;;
     observation|action|merge)
         if [[ "$trigger_source" == "$THINKER_NAME" ]]; then
-            exit 0   # our own step — should not arrive; no-op, leave timer
+            exit 0   # our own step — should not arrive; trap re-arms.
         fi
         wake_mode="reactive"     # an external event — engage
         ;;
@@ -199,6 +441,15 @@ if printf '%s' "$recent_context" | tail -n 1 | jq -e 'select(.type == "action")'
 fi
 if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '\n' ' ') == "thought " ]]; then
     hints="${hints}- The last few steps are all thoughts — the stream may be circling; consider acting, recalling, or advancing decisively.
+"
+fi
+# Unabsorbed external observations (hermes/overseer/mailbox) are the job of
+# this wakeup. Surface them as the wake seed so the first reasoning step
+# cannot skip past them into a generic orientation probe.
+if [[ "$wake_mode" == "reactive" && -n "$trigger_content" ]]; then
+    _seed=$(printf '%s' "$trigger_content" | tr '\n' ' ' | cut -c1-800)
+    hints="${hints}- REACTIVE wake from ${trigger_source:-unknown} (${trigger_type}). This observation is the job — do not spend the step checking wake type, chat history, or resting. Act on it or record why not.
+  wake seed: ${_seed}
 "
 fi
 # Pending requests from the responder (design/conversation_memory.md, part 5):
@@ -263,7 +514,14 @@ fi
 # The query for related memories is the wake's own material: the real hints
 # (before the placeholder below) and the last three stream steps.
 related_query="$hints $(printf '%s\n' "$recent_context" | tail -n 3 | jq -r '.content // ""' 2>/dev/null | cut -c1-600 | tr '\n' ' ')"
-[[ -z "$hints" ]] && hints="- (no special signals — pick what best serves the mind right now)"
+[[ -z "$hints" ]] && hints="- (no special signals — pick what best serves the mind right now)
+"
+# Gap sense: one line, injected here so it cannot be skipped the way a
+# sidecar file or `traj show` would be. Failure → `gap: unknown`.
+gap_stanza="gap: unknown"
+_gap_refresh || true
+hints="${gap_stanza}
+${hints}"
 
 prompt_file="$SCRIPT_DIR/prompt.md"
 [[ -f "$prompt_file" ]] || { printf 'monolith/step: error: prompt.md not found at %s\n' "$prompt_file" >&2; exit 1; }
@@ -306,19 +564,23 @@ $_rm
     fi
 fi
 
-route_prompt="<context>
-$system_prompt
-
-${life_section}Recent stream (last $THINK_CONTEXT_TAIL durable steps; \`traj tail -n 200\` shows more, verbatim):
-$recent_context
+# Job + routing FIRST. The rest of this prompt is tens of KB (skills,
+# identity, recent stream). Trajectory inline storage and some context
+# views keep only ~4096 bytes; if the wake seed sits at the end the
+# model never sees the observation it is supposed to absorb.
+route_prompt="Choose ONE function for this wakeup and carry it out now.
 
 ${related_section}Routing signals:
 $hints
 
 $think_prompt
-</context>
 
-Choose ONE function for this wakeup and carry it out now."
+<context>
+$system_prompt
+
+${life_section}Recent stream (last $THINK_CONTEXT_TAIL steps):
+$recent_context
+</context>"
 
 # Work probe: compare the last REAL-WORK step id before/after the run. Real work
 # is thought/action/observation/merge/message (NOT idle — a fallback idle is not
@@ -346,6 +608,120 @@ _last_visible_id() {
             | .step_id // empty' 2>/dev/null \
         | tail -n 1
 }
+
+# Run shellm with an INACTIVITY timeout plus a wall-clock ceiling. shellm's own
+# watchdog (SHELLM_INACTIVITY_TIMEOUT/MAX) guards a single exec block; this
+# wrapper guards the whole run, catching a shellm that wedges between blocks or
+# hangs on a provider stream. Two kill conditions:
+#   quiet — no stderr growth for SHELLM_STEP_TIMEOUT s (default
+#           SHELLM_INACTIVITY_MAX, 900). A healthy long run streams output
+#           continuously, so run length alone never kills it. (A pure
+#           wall-clock kill at 900s killed healthy 15-minute runs and drove
+#           backoff to the cap — maint-20260903-185858.)
+#   wall  — SHELLM_STEP_WALL_MAX s total (default 7200, 0 disables): the
+#           backstop so a single step can never wedge the thinker.
+# On kill the child process tree is terminated (TERM then KILL), rc is 124,
+# run_timeout_{kind,limit,quiet,elapsed} carry the activity snapshot for the
+# durable error step, and a marker line is appended to the stderr file so both
+# the live log and the error step's tail name the killer.
+
+_run_with_timeout() {
+    local quiet_max="${SHELLM_STEP_TIMEOUT:-${SHELLM_INACTIVITY_MAX:-900}}"
+    local wall_max="${SHELLM_STEP_WALL_MAX:-7200}"
+    local run_id_file="$1"
+    local run_stderr_file="$2"
+    # $3 is the prompt FILE path, not the prompt string: a mature identity's
+    # wakeup prompt exceeds MAX_ARG_STRLEN as an argv (rc=126), so it goes via
+    # --prompt-file. See the prompt_file_tmp note below.
+    local prompt_file="$3"
+
+    # Use temp files for stdout/stderr capture
+    local stdout_file
+    stdout_file=$(mktemp)
+
+    # Start shellm in background
+    {
+        SHELLM_NO_BANNER=1 \
+        SHELLM_TRIGGER_STEP_ID="$trigger_step_id" \
+        SHELLM_WAKE="$wake_reason" \
+        SHELLM_RUN_ID_OUT="$run_id_file" \
+        shellm --model "$THINK_MODEL" --traj "$TRAJ_ID" --context-scope run \
+            "${shellm_flags[@]}" \
+            --prompt-file "$prompt_file" >"$stdout_file" 2>"$run_stderr_file"
+        echo $? > "${stdout_file}.rc"
+    } &
+    local shellm_pid=$!
+
+    # Also tee stderr to the thinker log (fd 2) for live visibility
+    ( tail -f "$run_stderr_file" >&2 ) &
+    local tail_pid=$!
+
+    # Watch for inactivity (stderr stops growing) or the wall ceiling
+    local start_ts now cur_size quiet elapsed kind limit
+    start_ts=$(date +%s)
+    local last_size=0
+    local last_change_ts="$start_ts"
+    local rc=0
+    while kill -0 "$shellm_pid" 2>/dev/null; do
+        sleep 2
+        now=$(date +%s)
+        cur_size=$(wc -c < "$run_stderr_file" 2>/dev/null | tr -d ' ') || cur_size=0
+        if [[ "$cur_size" != "$last_size" ]]; then
+            last_size="$cur_size"
+            last_change_ts="$now"
+        fi
+        quiet=$(( now - last_change_ts ))
+        elapsed=$(( now - start_ts ))
+        kind=""
+        limit=""
+        if [[ "$quiet" -ge "$quiet_max" ]]; then
+            kind="quiet"; limit="$quiet_max"
+        elif [[ "$wall_max" -gt 0 && "$elapsed" -ge "$wall_max" ]]; then
+            kind="wall"; limit="$wall_max"
+        fi
+        if [[ -n "$kind" ]]; then
+            run_timeout_kind="$kind"
+            run_timeout_limit="$limit"
+            run_timeout_quiet="$quiet"
+            run_timeout_elapsed="$elapsed"
+            # Name the killer in the run's own stderr so the log and the
+            # error step's tail show WHY the run died, not just that it died.
+            printf '%s [step-timeout] %s limit %ss hit (quiet %ss, elapsed %ss): killing shellm pid %s\n' \
+                "$(date -u +%FT%TZ)" "$kind" "$limit" "$quiet" "$elapsed" "$shellm_pid" \
+                >> "$run_stderr_file"
+            # Kill the shellm process tree.
+            # Portable approach: find children via pgrep -P (works on Linux and macOS)
+            local children
+            children=$(pgrep -P "$shellm_pid" 2>/dev/null) || children=""
+            [[ -n "$children" ]] && kill -TERM $children 2>/dev/null || true
+            kill -TERM "$shellm_pid" 2>/dev/null || true
+            sleep 1
+            children=$(pgrep -P "$shellm_pid" 2>/dev/null) || children=""
+            [[ -n "$children" ]] && kill -KILL $children 2>/dev/null || true
+            kill -KILL "$shellm_pid" 2>/dev/null || true
+            rc=124  # timeout exit code
+            break
+        fi
+    done
+
+    # Clean up tail process
+    kill "$tail_pid" 2>/dev/null || true
+
+    # Read the exit code if shellm exited on its own
+    if [[ $rc -eq 0 ]] && [[ -f "${stdout_file}.rc" ]]; then
+        rc=$(cat "${stdout_file}.rc" 2>/dev/null) || rc=0
+    fi
+
+    # Capture stdout
+    run_response=$(cat "$stdout_file" 2>/dev/null) || run_response=""
+
+    # Cleanup temp files
+    rm -f "$stdout_file" "${stdout_file}.rc"
+
+    return $rc
+}
+
+
 _last_thought_id() {
     printf '%s\n' "$_probe_tail" \
         | jq -Rr 'fromjson? // empty | select(.type == "thought")
@@ -363,6 +739,9 @@ fi
 # shellm writes its run header's step_id here, so a fallback idle can carry
 # run_id and the timeline can pair it with the run that went quiet.
 run_id_file=$(mktemp)
+# shellm's stderr is tee'd here so a failed run's error step can carry the
+# provider context (redacted) — without it an rc=1 step says nothing about WHY.
+run_stderr_file=$(mktemp)
 
 # One shellm agentic run (writes to the root trajectory). Model via --model so
 # it cannot be shadowed by env/.env layers (see design/model-resolution.md).
@@ -384,14 +763,16 @@ esac
 prompt_file_tmp=$(mktemp "$state_dir/monolith_prompt.XXXXXX")
 printf '%s' "$route_prompt" > "$prompt_file_tmp"
 run_rc=0
-run_response=$(SHELLM_NO_BANNER=1 \
-    SHELLM_TRIGGER_STEP_ID="$trigger_step_id" \
-    SHELLM_WAKE="$wake_reason" \
-    SHELLM_RUN_ID_OUT="$run_id_file" \
-    shellm --model "$THINK_MODEL" --traj "$TRAJ_ID" --context-scope run \
-    "${shellm_flags[@]}" \
-    --prompt-file "$prompt_file_tmp") || run_rc=$?
+run_timeout_kind=""
+run_timeout_limit=""
+run_timeout_quiet=""
+run_timeout_elapsed=""
+# Run shellm under the inactivity/wall guard. The prompt goes via file
+# (prompt_file_tmp, created above) to dodge MAX_ARG_STRLEN; --context-scope run
+# and --prompt-file are applied inside _run_with_timeout.
+_run_with_timeout "$run_id_file" "$run_stderr_file" "$prompt_file_tmp" || run_rc=$?
 rm -f "$prompt_file_tmp"
+run_response="$run_response"  # set by _run_with_timeout
 
 after_visible=""
 after_thought=""
@@ -419,13 +800,42 @@ run_errored=0
 if [[ "$did_work" -eq 0 ]]; then
     idle_run_id=$(cat "$run_id_file" 2>/dev/null) || idle_run_id=""
     if [[ "$run_errored" -eq 1 ]]; then
-        printf '  run FAILED (rc=%s) — recording error\n' "$run_rc" >&2
+        # A wrapper-induced timeout kill is not a generic run failure: name it
+        # (reason=step-timeout) and carry the activity snapshot, so the
+        # trajectory shows a diagnosable kill instead of a bare rc=124.
+        if [[ "$run_rc" -eq 124 && -n "$run_timeout_kind" ]]; then
+            err_reason="step-timeout"
+            err_content="monolith run killed by step timeout (${run_timeout_kind} limit ${run_timeout_limit}s; quiet ${run_timeout_quiet}s, elapsed ${run_timeout_elapsed}s) with no durable step"
+            printf '  run TIMED OUT (%s limit %ss) — recording step-timeout\n' \
+                "$run_timeout_kind" "$run_timeout_limit" >&2
+        else
+            err_reason="run-failed"
+            err_content="monolith run failed (rc=${run_rc}) with no durable step"
+            printf '  run FAILED (rc=%s) — recording error\n' "$run_rc" >&2
+        fi
+        # Provider context: redacted tail of the run's stderr, so the failure
+        # mode (e.g. "OpenRouter empty stream") is diagnosable from the
+        # trajectory alone instead of only from run/logs/monolith.log.
+        err_tail=$(_stderr_tail_redacted "$run_stderr_file" "${MONOLITH_ERROR_TAIL_LINES:-15}") || err_tail=""
         jq -nc \
             --arg source "$THINKER_NAME" \
             --arg trigger "$trigger_step_id" \
             --arg run_id "$idle_run_id" \
+            --arg err_tail "$err_tail" \
+            --arg content "$err_content" \
+            --arg reason "$err_reason" \
+            --arg tkind "$run_timeout_kind" \
+            --arg tlimit "$run_timeout_limit" \
+            --arg tquiet "$run_timeout_quiet" \
+            --arg telapsed "$run_timeout_elapsed" \
             --argjson rc "$run_rc" \
-            '{type:"error", content:("monolith run failed (rc=\($rc)) with no durable step"), source:$source, reason:"run-failed", rc:$rc}
+            '{type:"error",
+              content:($content
+                       + (if $err_tail == "" then "" else "\nstderr tail:\n" + $err_tail end)),
+              source:$source, reason:$reason, rc:$rc}
+             + (if $reason != "step-timeout" then {} else
+                 {timeout:{kind:$tkind, limit_s:($tlimit|tonumber),
+                           quiet_s:($tquiet|tonumber), elapsed_s:($telapsed|tonumber)}} end)
              + (if $trigger == "" then {} else {trigger_step: $trigger} end)
              + (if $run_id == "" then {} else {run_id: $run_id} end)' \
             | traj append >/dev/null || true
@@ -441,7 +851,7 @@ if [[ "$did_work" -eq 0 ]]; then
             | traj append >/dev/null || true
     fi
 fi
-rm -f "$run_id_file"
+rm -f "$run_id_file" "$run_stderr_file"
 
 # ---------------------------------------------------------------------------
 # Backoff decision — sets next_delay for the EXIT trap.

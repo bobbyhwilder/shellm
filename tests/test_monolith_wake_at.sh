@@ -41,8 +41,20 @@ EOF
 #!/usr/bin/env bash
 [[ -n "${SHELLM_RUN_ID_OUT:-}" ]] && printf 'fake-run\n' > "$SHELLM_RUN_ID_OUT"
 if [[ -n "${SHELLM_PROMPT_OUT:-}" && $# -gt 0 ]]; then
-    eval "last=\${$#}"
-    printf '%s\n' "$last" > "$SHELLM_PROMPT_OUT"
+    # The prompt reaches shellm via --prompt-file <path> (avoids MAX_ARG_STRLEN);
+    # legacy callers passed it as the last positional arg. Capture the text
+    # either way so the assertions see prompt content, not a temp-file path.
+    _pf="" _prev=""
+    for _a in "$@"; do
+        [[ "$_prev" == "--prompt-file" ]] && _pf="$_a"
+        _prev="$_a"
+    done
+    if [[ -n "$_pf" && -f "$_pf" ]]; then
+        cat "$_pf" > "$SHELLM_PROMPT_OUT"
+    else
+        eval "last=\${$#}"
+        printf '%s\n' "$last" > "$SHELLM_PROMPT_OUT"
+    fi
 fi
 if [[ -n "${SHELLM_WAKE_OUT:-}" ]]; then
     printf '%s\n' "${SHELLM_WAKE:-}" > "$SHELLM_WAKE_OUT"
