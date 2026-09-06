@@ -234,13 +234,31 @@ $(cat "$f")
     # before its first visible token (glm 5.3 flash: 31s on the box,
     # 2026-09-03). MEM_SEARCH_HEARTBEAT_S=0 disables it.
     local hb="${MEM_SEARCH_HEARTBEAT_S:-10}" _hb_pid=""
-    [[ "$hb" != 0 ]] && { ( while :; do sleep "$hb"; printf 'mem search: waiting for the model...\n' >&2; done ) & _hb_pid=$!; }
+    # sleep gets its own fds: killing the heartbeat orphans the in-flight
+    # sleep, and if it inherited our pipes it would hold a caller's
+    # `$(mem search ...)` capture open for up to a full interval after exit.
+    [[ "$hb" != 0 ]] && { ( while :; do sleep "$hb" >/dev/null 2>&1; printf 'mem search: waiting for the model...\n' >&2; done ) & _hb_pid=$!; }
+    # A hard cap on the model call: a hung llm otherwise blocks until the
+    # caller's own watchdog kills the whole command (cleo wakeups die at ~30s
+    # of silence, and a captured stderr hides the heartbeat). Wrap with
+    # timeout(1) when one is on PATH (bin/timeout ships a portable shim);
+    # without one the call runs unbounded, as before. 0 disables the cap.
+    local to="${MEM_SEARCH_TIMEOUT:-120}"
+    local _bound=()
+    if [[ "$to" != 0 ]]; then
+        if command -v timeout >/dev/null 2>&1; then _bound=(timeout "$to")
+        elif command -v gtimeout >/dev/null 2>&1; then _bound=(gtimeout "$to")
+        fi
+    fi
+    local rc=0
     # shellcheck disable=SC2086
     printf 'Search these memories for: %s\n\n%s' "$query" "$memories" | \
-        llm ${SHELLM_FAST_MODEL:+-m "$SHELLM_FAST_MODEL"} -t "${MEM_SEARCH_MAX_TOKENS:-16000}" \
-            -s "You are a semantic search engine for memory files. Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body. Return ONLY the filenames and summaries of semantically matching memories, one per line. If nothing matches, say 'No matches found.'"
-    local rc=$?
+        "${_bound[@]+"${_bound[@]}"}" llm ${SHELLM_FAST_MODEL:+-m "$SHELLM_FAST_MODEL"} -t "${MEM_SEARCH_MAX_TOKENS:-16000}" \
+            -s "You are a semantic search engine for memory files. Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body. Return ONLY the filenames and summaries of semantically matching memories, one per line. If nothing matches, say 'No matches found.'" || rc=$?
     if [[ -n "$_hb_pid" ]]; then kill "$_hb_pid" 2>/dev/null || true; wait "$_hb_pid" 2>/dev/null || true; fi
+    if [[ "$rc" -eq 124 ]]; then
+        printf 'mem search: error: llm timed out after %ss (MEM_SEARCH_TIMEOUT)\n' "$to" >&2
+    fi
     return "$rc"
 }
 
@@ -473,6 +491,8 @@ Environment:
                          model thinks against it, so keep it roomy)
   MEM_SEARCH_HEARTBEAT_S Seconds between "waiting" lines on stderr while the
                          model works (10; 0 disables)
+  MEM_SEARCH_TIMEOUT     Seconds before the search's model call is killed and
+                         the search exits 124 (120; 0 disables)
   SHELLM_FAST_MODEL      Cheap model class for the search call
 EOF
     exit 0

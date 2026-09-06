@@ -133,35 +133,53 @@ arm_wake() {
     printf '%s' "$(( now + delay ))" > "$wake_at_file"
 }
 
-# Redacted last-N-lines of a run's stderr for the durable error step.
-# Strips ANSI, then masks sk-* keys, Bearer tokens, api_key= and token:
-# values so provider context is diagnosable without leaking secrets into
-# the trajectory. Fail-soft: missing file → empty stdout, exit 0.
-_stderr_tail_redacted() {
-    local file="${1:-}" n="${2:-15}"
-    [[ -n "$file" && -f "$file" ]] || return 0
-    python3 - "$file" "$n" <<'PY'
+# Strip ANSI, then mask sk-* keys, Bearer tokens, api_key= and token: values
+# (stdin → stdout), so run context is diagnosable without leaking secrets into
+# the trajectory. Fail-soft the safe way round: if python3 is missing or dies,
+# output is EMPTY, never unredacted passthrough.
+_redact_stream() {
+    # -c, not a stdin heredoc: stdin carries the text being redacted.
+    python3 -c '
 import re, sys
-path, n_s = sys.argv[1], sys.argv[2]
-try:
-    n = int(n_s)
-except ValueError:
-    n = 15
-try:
-    raw = open(path, "r", errors="replace").read()
-except OSError:
-    sys.exit(0)
-raw = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw)
-lines = raw.splitlines()
-n = max(0, n)
-tail = lines[-n:] if n else lines
-text = "\n".join(tail)
+text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
 text = re.sub(r"sk-[A-Za-z0-9_-]+", "[redacted]", text)
 text = re.sub(r"(?i)(api[_-]?key\s*[=:]\s*)\S+", r"\1[redacted]", text)
 text = re.sub(r"(?i)(token:\s*)\S+", r"\1[redacted]", text)
 text = re.sub(r"(?i)(Bearer\s+)\S+", r"\1[redacted]", text)
 sys.stdout.write(text)
-PY
+'
+}
+
+# Redacted last-N-lines of a run's stderr for the durable error step.
+# Fail-soft: missing file → empty stdout, exit 0.
+_stderr_tail_redacted() {
+    local file="${1:-}" n="${2:-15}"
+    [[ -n "$file" && -f "$file" ]] || return 0
+    [[ "$n" =~ ^[0-9]+$ ]] || n=15
+    tail -n "$n" -- "$file" 2>/dev/null | _redact_stream
+}
+
+# Last attempted command of a failed run, for the durable error step: the
+# newest reasoning step carrying this run_id in the trajectory tail, plus the
+# paired shell exit when one is visible. Truncated and redacted — enough to
+# show the SHAPE of what the model tried (stray ```bash fence, wrong
+# subcommand or flag style) without archiving a raw command blob. Empty when
+# the run died before its first command (e.g. provider failure on the opening
+# llm call). Reads _probe_tail, so call after _refresh_probe.
+_attempted_cmd_redacted() {
+    local run_id="${1:-}" max_chars="${2:-400}"
+    [[ -n "$run_id" && -n "${_probe_tail:-}" ]] || return 0
+    [[ "$max_chars" =~ ^[0-9]+$ ]] || max_chars=400
+    printf '%s\n' "$_probe_tail" | jq -Rrs --arg rid "$run_id" --argjson max "$max_chars" '
+        [ split("\n")[] | fromjson? | select((.run_id // "") == $rid) ] as $steps
+        | ([$steps[] | select(.type == "reasoning") | .cmd // ""] | last // "") as $cmd
+        | ([$steps[] | select(.type == "shell-output") | .exit] | last) as $exit
+        | if $cmd == "" then empty else
+            ($cmd | .[0:$max])
+            + (if ($cmd | length) > $max then "…[truncated]" else "" end)
+            + (if $exit == null then "" else "\n(last shell exit: " + ($exit | tostring) + ")" end)
+          end' 2>/dev/null | _redact_stream
 }
 
 
@@ -789,39 +807,49 @@ did_thought=0
 did_work=0
 [[ "$did_visible" -eq 1 || "$did_thought" -eq 1 ]] && did_work=1
 
-# Classify a no-durable-work run: a FAILED run (rc != 0) is not the same as a
-# calm decision to idle. Record the failure as a visible `error` step instead of
-# a silent `idle` — otherwise crashes masquerade as healthy resting, invisible
-# on the timeline and to the operator, and wrongly pace the mind. See
-# design/monolith_run_health.md B2. (Under trigger_self:false neither step drives
-# the loop — the EXIT trap's arm_wake does — they just mark the wake.)
+# Classify the run's ending: a FAILED run (rc != 0) is not the same as a calm
+# decision to idle. Record EVERY failure as a visible `error` step — even when
+# the run wrote durable work before dying — otherwise crashes masquerade as
+# healthy resting or completed work, invisible on the timeline and to the
+# operator, and wrongly pace the mind. Four rc=1 wakes in ~5min left nothing
+# but stderr tails to diagnose from (maint-20260906-051155). See
+# design/monolith_run_health.md B2. (Under trigger_self:false neither step
+# drives the loop — the EXIT trap's arm_wake does — they just mark the wake.)
 run_errored=0
 [[ "$run_rc" -ne 0 ]] && run_errored=1
-if [[ "$did_work" -eq 0 ]]; then
+if [[ "$run_errored" -eq 1 || "$did_work" -eq 0 ]]; then
     idle_run_id=$(cat "$run_id_file" 2>/dev/null) || idle_run_id=""
     if [[ "$run_errored" -eq 1 ]]; then
+        durable_note="with no durable step"
+        [[ "$did_work" -eq 1 ]] && durable_note="after writing durable step(s)"
         # A wrapper-induced timeout kill is not a generic run failure: name it
         # (reason=step-timeout) and carry the activity snapshot, so the
         # trajectory shows a diagnosable kill instead of a bare rc=124.
         if [[ "$run_rc" -eq 124 && -n "$run_timeout_kind" ]]; then
             err_reason="step-timeout"
-            err_content="monolith run killed by step timeout (${run_timeout_kind} limit ${run_timeout_limit}s; quiet ${run_timeout_quiet}s, elapsed ${run_timeout_elapsed}s) with no durable step"
+            err_content="monolith run killed by step timeout (${run_timeout_kind} limit ${run_timeout_limit}s; quiet ${run_timeout_quiet}s, elapsed ${run_timeout_elapsed}s) ${durable_note}"
             printf '  run TIMED OUT (%s limit %ss) — recording step-timeout\n' \
                 "$run_timeout_kind" "$run_timeout_limit" >&2
         else
             err_reason="run-failed"
-            err_content="monolith run failed (rc=${run_rc}) with no durable step"
+            err_content="monolith run failed (rc=${run_rc}) ${durable_note}"
             printf '  run FAILED (rc=%s) — recording error\n' "$run_rc" >&2
         fi
         # Provider context: redacted tail of the run's stderr, so the failure
         # mode (e.g. "OpenRouter empty stream") is diagnosable from the
         # trajectory alone instead of only from run/logs/monolith.log.
         err_tail=$(_stderr_tail_redacted "$run_stderr_file" "${MONOLITH_ERROR_TAIL_LINES:-15}") || err_tail=""
+        # Command context: what the run last TRIED (truncated, redacted), so
+        # the shape of a failure — a stray ```bash fence, a bad `mem`/`traj`
+        # invocation — is visible to signal detectors and the mind itself,
+        # not only its stderr symptom.
+        err_cmd=$(_attempted_cmd_redacted "$idle_run_id" "${MONOLITH_ERROR_CMD_CHARS:-400}") || err_cmd=""
         jq -nc \
             --arg source "$THINKER_NAME" \
             --arg trigger "$trigger_step_id" \
             --arg run_id "$idle_run_id" \
             --arg err_tail "$err_tail" \
+            --arg err_cmd "$err_cmd" \
             --arg content "$err_content" \
             --arg reason "$err_reason" \
             --arg tkind "$run_timeout_kind" \
@@ -831,6 +859,7 @@ if [[ "$did_work" -eq 0 ]]; then
             --argjson rc "$run_rc" \
             '{type:"error",
               content:($content
+                       + (if $err_cmd == "" then "" else "\nlast attempted cmd (truncated, redacted):\n" + $err_cmd end)
                        + (if $err_tail == "" then "" else "\nstderr tail:\n" + $err_tail end)),
               source:$source, reason:$reason, rc:$rc}
              + (if $reason != "step-timeout" then {} else

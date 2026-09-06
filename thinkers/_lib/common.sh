@@ -533,6 +533,13 @@ _build_shellm_flags() {
     printf '%s\n' "--var" "SKILLS_KERNEL_DIR=$abs_kernel_dir"
     printf '%s\n' "--var" "TRAJ_DIR=$abs_traj_dir"
     printf '%s\n' "--var" "TRAJ_ID=$TRAJ_ID"
+    # mem search calls a model. When generated code captures both streams
+    # (`$(mem search ... 2>&1)`), the heartbeat never reaches shellm's
+    # watchdog and the whole block is KILLed at the ~30s inactivity limit
+    # (3 kills on mem prefilter/search shapes, 2026-09-06). Cap the model
+    # call just under that budget so mem fails fast with a clear error the
+    # actor can react to instead.
+    printf '%s\n' "--var" "MEM_SEARCH_TIMEOUT=${MEM_SEARCH_TIMEOUT:-25}"
     # chat reads the identity-specific sender config through CHATRC. The
     # identity directory is already mounted into Docker; only the path was
     # missing from generated-code runs.

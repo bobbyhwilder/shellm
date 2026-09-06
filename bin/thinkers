@@ -962,6 +962,27 @@ _dispatcher_on_signal() {
     fi
     printf '%s [dispatcher] caught unsanctioned SIG%s (pid %s) — exiting 130\n' \
         "$(date -u +%FT%TZ)" "$sig" "$$" >&2
+    # signal-source diagnostic: a shell trap can't see the sender's pid, so
+    # snapshot our ancestry and process group at signal time — enough to
+    # correlate with launchd/overseer/systemd activity when attributing the
+    # kill (the 2026-09-06 deaths were launchd reaping the overseer job's
+    # process group on job exit).
+    {
+        echo "=== signal-source $(date -u +%FT%TZ) SIG$sig pid=$$ ppid=$PPID ==="
+        ps -o pid,ppid,pgid,sess,lstart,command -p "$$" -p "$PPID" 2>/dev/null || true
+        local _sig_pgid
+        _sig_pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')
+        if [[ -n "$_sig_pgid" ]]; then
+            # Everyone sharing our process group. macOS ps has no pgid
+            # filter (-g means something else there), so filter with awk.
+            ps ax -o pid,ppid,pgid,sess,command 2>/dev/null \
+                | awk -v pg="$_sig_pgid" 'NR == 1 || $3 == pg' || true
+        fi
+        if command -v pstree >/dev/null 2>&1; then
+            pstree -p "$$" 2>/dev/null || true
+        fi
+        echo "=== end signal-source ==="
+    } >> "$run_dir/logs/dispatcher.log" 2>&1 || true
     printf 'SIG%s\n' "$sig" > "$run_dir/last_signal" 2>/dev/null || true
     logger -t headlong-thinkers \
         "dispatcher(${IDENTITY_NAME:-unknown}) pid $$ caught unsanctioned SIG${sig}" \

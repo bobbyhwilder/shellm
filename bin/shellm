@@ -78,9 +78,11 @@ if [[ -n "$SHELLM_API_URL" ]]; then
 fi
 SHELLM_MAX_TOKENS="${SHELLM_MAX_TOKENS:-}"
 SHELLM_EFFORT="${SHELLM_EFFORT:-high}"
+# Optional second model tried once per call when SHELLM_MODEL's provider fails
+# transiently (emits nothing / network hiccup) even after llm's own retries.
+# Empty (the default) disables the fallback.
+SHELLM_FALLBACK_MODEL="${SHELLM_FALLBACK_MODEL:-}"
 # The loop runs the first fenced block of a response and drops the rest, so
-# llm may stop reading the stream the moment that block closes
-# (LLM_STOP_AFTER_CODE_BLOCK in bin/llm). A model that keeps writing after
 # its command, or loops that way until the transfer times out, then costs
 # nothing past the block. 0 reads every response to the end as before.
 SHELLM_STOP_AFTER_CODE_BLOCK="${SHELLM_STOP_AFTER_CODE_BLOCK:-1}"
@@ -287,6 +289,10 @@ Environment:
   SHELLM_MODEL            Model to use
   SHELLM_FAST_MODEL       Cheap model class for utility calls (summaries,
                           mem search); defaults to SHELLM_MODEL's provider
+  SHELLM_FALLBACK_MODEL   Optional second model tried once per call when the
+                          primary model's provider fails transiently (emits
+                          nothing / network hiccup) even after llm's own
+                          retries. Empty (the default) disables the fallback.
   SHELLM_MAX_ITERATIONS   Max loop iterations
   SHELLM_MAX_TOKENS       Max tokens per response
   SHELLM_STOP_AFTER_CODE_BLOCK
@@ -1537,6 +1543,16 @@ call_llm() {
     messages_file=$(mktemp)
     printf '%s' "$messages_json" > "$messages_file"
 
+    # Build fallback args if SHELLM_FALLBACK_MODEL is set
+    local fallback_model="${SHELLM_FALLBACK_MODEL:-}"
+    local -a fallback_args=()
+    if [[ -n "$fallback_model" ]]; then
+        fallback_args=(-m "$fallback_model"
+            --effort "$SHELLM_EFFORT" --thinking --system-prompt "$system_prompt" --messages-file "$messages_file")
+        [[ -n "$SHELLM_MAX_TOKENS" ]] && fallback_args+=(-t "$SHELLM_MAX_TOKENS")
+        [[ "${SHELLM_STOP_AFTER_CODE_BLOCK:-1}" == 1 ]] && fallback_args+=(--stop-after-code-block)
+    fi
+
     local -a args=(-m "$SHELLM_MODEL"
         --effort "$SHELLM_EFFORT" --thinking --system-prompt "$system_prompt" --messages-file "$messages_file")
     [[ -n "$SHELLM_MAX_TOKENS" ]] && args+=(-t "$SHELLM_MAX_TOKENS")
@@ -1545,6 +1561,7 @@ call_llm() {
     local text_file stderr_file
     text_file=$(mktemp)
     stderr_file=$(mktemp)
+    local fallback_tried=0
 
     # Run llm, capturing stdout to text_file and stderr to stderr_file.
     # When not quiet, also tee stdout to stderr (for live display) and
@@ -1573,6 +1590,34 @@ call_llm() {
         [[ -s "$stderr_file" ]] && _llm_err=$(tail -c 500 "$stderr_file")
         rm -f "$text_file" "$stderr_file" "$messages_file"
         die "llm failed (exit $llm_exit): $_llm_err"
+    fi
+
+    # If the primary model emitted nothing on stdout, try the fallback model
+    # once (if configured). This handles "empty stream" provider failures
+    # where llm exits 0 but produces no visible output.
+    if [[ -n "$fallback_model" && "$fallback_tried" -eq 0 && ! -s "$text_file" ]]; then
+        fallback_tried=1
+        progress "Primary model emitted no output — trying fallback model: $fallback_model..."
+        # Retry with fallback model, reusing the same messages file
+        if [[ "$QUIET" -eq 0 ]]; then
+            { llm "${fallback_args[@]}" 2>"$stderr_file"; echo $? > "$text_file.rc"; } | tee "$text_file" >&2
+            llm_exit=$(cat "$text_file.rc" 2>/dev/null) || llm_exit=0
+            rm -f "$text_file.rc"
+            if [[ -s "$stderr_file" ]]; then
+                cat "$stderr_file" >&2
+                [[ -n "$thinking_output_file" ]] && cp "$stderr_file" "$thinking_output_file"
+            fi
+        else
+            llm "${fallback_args[@]}" > "$text_file" 2>"$stderr_file" || llm_exit=$?
+            [[ -n "$thinking_output_file" ]] && cp "$stderr_file" "$thinking_output_file"
+        fi
+        # If fallback also failed non-zero, treat as real error
+        if [[ "$llm_exit" -ne 0 ]]; then
+            local _llm_err=""
+            [[ -s "$stderr_file" ]] && _llm_err=$(tail -c 500 "$stderr_file")
+            rm -f "$text_file" "$stderr_file" "$messages_file"
+            die "llm failed (exit $llm_exit): $_llm_err"
+        fi
     fi
 
     # No visible text is not a failure. `llm --thinking` streams reasoning to
@@ -1700,6 +1745,13 @@ extract_code() {
     if [[ -z "$code" ]]; then
         code=$(printf '%s\n' "$response" | sed '/^[[:space:]]*\[cmd\][[:space:]]*$/d; /^[[:space:]]*\[thought\]/d')
     fi
+
+    # A double-fenced response (an outer bare ``` pair wrapping an inner
+    # ```bash block — a model quoting its own code block) opens on the outer
+    # fence and collects the inner opener as the first code line, so the run
+    # executes "```bash: command not found" (observed on Cleo, 2026-09-06).
+    # A fence line is never valid bash, so drop a leading one.
+    code=$(printf '%s\n' "$code" | sed '1{/^[[:space:]]*```/d;}')
 
     # If the model emitted extra blocks past the first, prepend a notice
     # echoed to stderr.  Stderr is captured and shown back to the model on

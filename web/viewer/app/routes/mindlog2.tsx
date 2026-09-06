@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { ExternalLink, Maximize2, Minimize2 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router";
 
 import { IdentityTabs } from "~/components/identity-tabs";
@@ -15,7 +16,6 @@ export function meta() {
 }
 
 /** Presentation stream: newest first, so a calm page with no scroll chasing. */
-const MAX_CARDS = 80;
 /** Clamp long bodies; the video's one-liners are not how Audel writes. */
 const CLAMP_CHARS = 420;
 
@@ -153,39 +153,32 @@ export default function Mindlog2Page() {
       initialEndRef.current = mindlog.start + mindlog.steps.length;
     }
   }, [mindlog]);
-
   const cards = useMemo(() => {
     if (!mindlog) return [];
-    const name = mindlog.identity.name;
-    const out: { card: Ml2Card; abs: number }[] = [];
-    for (let i = mindlog.steps.length - 1; i >= 0 && out.length < MAX_CARDS; i--) {
-      const card = toCard(mindlog.steps[i], name);
-      if (card && !hidden.has(card.group)) {
-        out.push({ card, abs: mindlog.start + i });
-      }
-    }
-    return out;
+    const all = mindlog.steps
+      .map((step, idx) => toCard(step, mindlog.identity.name))
+      .filter((c): c is Ml2Card => c !== null);
+    const visible = all.filter((c) => !hidden.has(c.group));
+    return visible.map((card, abs) => ({ card, abs }));
   }, [mindlog, hidden]);
 
-  const counts = useMemo(() => {
-    const map = new Map<CardGroup, number>();
-    if (!mindlog) return map;
-    const name = mindlog.identity.name;
-    for (const step of mindlog.steps) {
-      const card = toCard(step, name);
-      if (card) map.set(card.group, (map.get(card.group) ?? 0) + 1);
-    }
-    return map;
-  }, [mindlog]);
+  // Virtualizer for the stream
+  const parentRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: cards.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 200,
+    overscan: 10,
+  });
 
-  const toggle = (group: CardGroup) => {
+  const toggle = useCallback((group: CardGroup) => {
     setHidden((prev) => {
       const next = new Set(prev);
       if (next.has(group)) next.delete(group);
       else next.add(group);
       return next;
     });
-  };
+  }, []);
 
   useEffect(() => {
     if (!fullscreen) return;
@@ -197,6 +190,16 @@ export default function Mindlog2Page() {
   }, [fullscreen]);
 
   const displayName = mindlog?.identity.name ?? identityId.split("~").pop() ?? identityId;
+
+  const counts = useMemo(() => {
+    const c = new Map<CardGroup, number>();
+    if (!mindlog) return c;
+    for (const step of mindlog.steps) {
+      const card = toCard(step, mindlog.identity.name);
+      if (card) c.set(card.group, (c.get(card.group) ?? 0) + 1);
+    }
+    return c;
+  }, [mindlog]);
 
   const canvas = (
     <div
@@ -260,19 +263,41 @@ export default function Mindlog2Page() {
             </span>
           </div>
 
-          <div className="mt-6 flex flex-col gap-5 pb-10">
+          <div className="mt-6" ref={parentRef} style={{ height: "100%", overflow: "auto" }}>
             {cards.length === 0 && (
               <div className="py-16 text-center font-mono text-sm text-zinc-500">
                 waiting for thoughts…
               </div>
             )}
-            {cards.map(({ card, abs }) => (
-              <StreamCard
-                key={card.step_id || abs}
-                card={card}
-                animate={initialEndRef.current !== null && abs >= initialEndRef.current}
-              />
-            ))}
+            <div
+              style={{
+                height: `${virtualizer.getTotalSize()}px`,
+                width: "100%",
+                position: "relative",
+              }}
+            >
+              {virtualizer.getVirtualItems().map((virtualRow) => (
+                <div
+                  key={cards[virtualRow.index].card.step_id || virtualRow.index}
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    height: `${virtualRow.size}px`,
+                    transform: `translateY(${virtualRow.start}px)`,
+                  }}
+                >
+                  <StreamCard
+                    card={cards[virtualRow.index].card}
+                    animate={
+                      initialEndRef.current !== null &&
+                      cards[virtualRow.index].abs >= initialEndRef.current
+                    }
+                  />
+                </div>
+              ))}
+            </div>
           </div>
         </main>
       </div>

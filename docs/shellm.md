@@ -357,6 +357,7 @@ All configuration is available as both CLI flags and environment variables. Flag
 | `--max-iterations` | `SHELLM_MAX_ITERATIONS` | unlimited | Max loop iterations before giving up |
 | `--max-tokens` | `SHELLM_MAX_TOKENS` | model's max output cap | Max tokens per API response |
 | — | `SHELLM_EMPTY_RESPONSE_RETRIES` | `8` | Empty-response retries before the run dies (set empty for unlimited) |
+| — | `SHELLM_FALLBACK_MODEL` | (empty) | Optional second model tried once per call when the primary model's provider fails transiently (emits nothing / network hiccup) even after llm's own retries. Empty (the default) disables the fallback. |
 | `--effort` | `SHELLM_EFFORT` | `high` | Thinking effort: low, medium, high, xhigh, max |
 | — | `SHELLM_INACTIVITY_TIMEOUT` | `30` | Seconds before killing idle execution |
 | — | `SHELLM_INACTIVITY_MAX` | `900` | Seconds before killing execution that is silent but has a live nested run |
